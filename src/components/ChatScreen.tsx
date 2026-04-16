@@ -1,6 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ArrowLeft, Send, Phone, Mic, RotateCw } from "lucide-react";
+import {
+  sendMessageStream,
+  checkHealth,
+  buildSystemPrompt,
+  buildStorageKey,
+  type ChatHistoryTurn,
+} from "@/lib/streamClient";
 
 interface Message {
   id: string;
@@ -15,20 +22,13 @@ interface ChatScreenProps {
   memoryId?: string;
 }
 
-const STORAGE_KEY = "afterlife-messages";
-
-function buildSystemPrompt(name: string): string {
-  return (
-    `You are ${name}, a loving person who has passed away and is speaking ` +
-    `with someone who misses you deeply. Respond with warmth, specific ` +
-    `memories, and affection in the voice of ${name}. Keep replies short, ` +
-    `personal, and gentle. Never break character or mention being an AI.`
-  );
+function makeId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function loadStoredMessages(): Message[] | null {
+function loadStoredMessages(storageKey: string): Message[] | null {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(storageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed) || parsed.length === 0) return null;
@@ -38,15 +38,17 @@ function loadStoredMessages(): Message[] | null {
   }
 }
 
-const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
+const ChatScreen = ({ name, photo, onBack, memoryId }: ChatScreenProps) => {
+  const storageKey = buildStorageKey(memoryId, name);
+
   const welcomeMessage: Message = {
     id: "welcome",
     role: "assistant",
-    content: `Hi sweetheart, it's so good to hear from you. What's on your mind?`,
+    content: `Hi sweetheart, it's ${name}. It's so good to hear from you. What's on your mind?`,
   };
 
   const [messages, setMessages] = useState<Message[]>(
-    () => loadStoredMessages() ?? [welcomeMessage]
+    () => loadStoredMessages(storageKey) ?? [welcomeMessage],
   );
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
@@ -55,25 +57,26 @@ const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
   const [lastFailedText, setLastFailedText] = useState<string | null>(null);
   const [serviceStatus, setServiceStatus] = useState<"online" | "unavailable">("online");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const streamRef = useRef<{ abort: () => void } | null>(null);
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+      window.localStorage.setItem(storageKey, JSON.stringify(messages));
     } catch {
       // ignore storage quota errors
     }
-  }, [messages]);
+  }, [messages, storageKey]);
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = setTimeout(async () => {
-      try {
-        const res = await fetch("/api/health", { method: "GET" });
-        setServiceStatus(res && res.ok ? "online" : "unavailable");
-      } catch {
-        setServiceStatus("unavailable");
-      }
+      const status = await checkHealth(controller.signal);
+      if (!controller.signal.aborted) setServiceStatus(status);
     }, 300);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -83,70 +86,100 @@ const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
     });
   }, [messages, isTyping]);
 
-  const callApi = useCallback(
-    async (text: string, history: Message[]) => {
+  useEffect(() => {
+    return () => {
+      streamRef.current?.abort();
+    };
+  }, []);
+
+  const streamReply = useCallback(
+    (text: string, history: ChatHistoryTurn[]) => {
       setIsSending(true);
       setIsTyping(true);
       setError(null);
 
-      try {
-        const response = await fetch("/api/messages", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: text,
-            personName: name,
-            systemPrompt: buildSystemPrompt(name),
-            history: history.map((m) => ({ role: m.role, content: m.content })),
-          }),
-        });
+      const assistantId = makeId("a");
 
-        if (!response.ok) {
-          throw new Error("server_error");
-        }
+      setMessages((prev) => [
+        ...prev,
+        { id: assistantId, role: "assistant", content: "" },
+      ]);
 
-        const data = await response.json();
-        const reply: Message = {
-          id: `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          role: "assistant",
-          content: typeof data?.reply === "string" ? data.reply : "",
-        };
-        setMessages((prev) => [...prev, reply]);
-        setLastFailedText(null);
-      } catch (err) {
-        if (err instanceof TypeError) {
-          setError("No connection. Please check your network and try again.");
-        } else {
-          setError("Something went wrong. Please try again.");
-        }
-        setLastFailedText(text);
-      } finally {
-        setIsTyping(false);
-        setIsSending(false);
-      }
+      streamRef.current = sendMessageStream(
+        {
+          message: text,
+          personName: name,
+          systemPrompt: buildSystemPrompt(name),
+          history,
+          memoryId,
+        },
+        {
+          onDelta: (delta) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, content: m.content + delta } : m,
+              ),
+            );
+          },
+          onDone: () => {
+            setIsTyping(false);
+            setIsSending(false);
+            setLastFailedText(null);
+            streamRef.current = null;
+          },
+          onError: (kind) => {
+            setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+            setIsTyping(false);
+            setIsSending(false);
+            setError(
+              kind === "network"
+                ? "No connection. Please check your network and try again."
+                : "Something went wrong. Please try again.",
+            );
+            setLastFailedText(text);
+            streamRef.current = null;
+          },
+        },
+      );
     },
-    [name]
+    [name, memoryId],
   );
 
   const sendMessage = () => {
     const text = input.trim();
     if (!text || isSending) return;
 
-    const userMsg: Message = {
-      id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      role: "user",
-      content: text,
-    };
-    const historyForApi = messages;
+    const userMsg: Message = { id: makeId("u"), role: "user", content: text };
+    const historyForApi: ChatHistoryTurn[] = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
-    void callApi(text, historyForApi);
+    streamReply(text, historyForApi);
   };
 
   const retryLast = () => {
     if (!lastFailedText || isSending) return;
-    const historyForApi = messages;
-    void callApi(lastFailedText, historyForApi);
+    const trimmed: Message[] = [];
+    let removed = false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (
+        !removed &&
+        m.role === "user" &&
+        m.content === lastFailedText
+      ) {
+        removed = true;
+        continue;
+      }
+      trimmed.unshift(m);
+    }
+    const historyForApi: ChatHistoryTurn[] = trimmed.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+    streamReply(lastFailedText, historyForApi);
   };
 
   const statusLabel = serviceStatus === "online" ? "Online" : "Unavailable";
