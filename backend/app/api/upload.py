@@ -8,8 +8,9 @@ object in Supabase Storage. Returns 413 for oversized uploads and
 422 for wrong MIME types, malformed audio headers, or voice samples
 shorter than the 3-second minimum required by the voice-cloning flow.
 """
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
+from app.api.deps import get_current_user
 from app.services import storage_service
 from testing_utils import audio as audio_utils
 
@@ -21,7 +22,10 @@ MIN_AUDIO_SECONDS = 3.0
 
 
 @router.post("/photo")
-async def upload_photo(file: UploadFile = File(...)):
+async def upload_photo(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
     content_type = (file.content_type or "").lower()
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=422, detail="file must be an image")
@@ -40,7 +44,10 @@ async def upload_photo(file: UploadFile = File(...)):
 
 
 @router.post("/audio")
-async def upload_audio(file: UploadFile = File(...)):
+async def upload_audio(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
     content_type = (file.content_type or "").lower()
     if not content_type.startswith("audio/"):
         raise HTTPException(status_code=422, detail="file must be audio")
