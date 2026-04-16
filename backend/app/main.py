@@ -4,6 +4,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
+from app.api.upload import router as upload_router
 from app.models.stream import MessageRequest
 from app.services import ai_service
 from app.services.persona_service import build_system_prompt
@@ -12,6 +13,7 @@ from app.services.safety_service import is_crisis_message, SAFE_RESPONSE
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Afterlife API")
+app.include_router(upload_router)
 
 FALLBACK_ON_ERROR = (
     "I love you, sweetheart. I hear you. I'm always here for you."
