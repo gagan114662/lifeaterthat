@@ -14,24 +14,74 @@ import ChatScreen from "@/components/ChatScreen";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function mockApiSuccess(reply: string) {
-  (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+function encodeSse(chunks: Array<{ type: string; content: string }>): Uint8Array {
+  const text = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("");
+  return new TextEncoder().encode(text);
+}
+
+function sseResponse(chunks: Array<{ type: string; content: string }>) {
+  const bytes = encodeSse(chunks);
+  return {
     ok: true,
-    json: async () => ({ reply }),
+    status: 200,
+    body: {
+      getReader: () => {
+        let sent = false;
+        return {
+          read: async () => {
+            if (sent) return { done: true, value: undefined };
+            sent = true;
+            return { done: false, value: bytes };
+          },
+          releaseLock: () => {},
+          cancel: async () => {},
+        };
+      },
+    },
+  };
+}
+
+function mockApiSuccess(reply: string) {
+  (global.fetch as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
+    if (typeof url === "string" && url.includes("/api/health")) {
+      return Promise.resolve({ ok: true, status: 200 });
+    }
+    return Promise.resolve(
+      sseResponse([
+        { type: "text_delta", content: reply },
+        { type: "stream_end", content: "" },
+      ]),
+    );
   });
 }
 
 function mockApiFailure(status = 500) {
-  (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-    ok: false,
-    status,
-    json: async () => ({ error: "Internal server error" }),
+  (global.fetch as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
+    if (typeof url === "string" && url.includes("/api/health")) {
+      return Promise.resolve({ ok: true, status: 200 });
+    }
+    return Promise.resolve({ ok: false, status });
   });
 }
 
 async function sendMessage(text: string) {
   // Use Enter key — the code already supports this and avoids needing aria-label on send button
   await userEvent.type(screen.getByPlaceholderText("Type a message..."), `${text}{Enter}`);
+}
+
+interface RequestBody {
+  message: string;
+  personName: string;
+  systemPrompt: string;
+  history: Array<{ role: string; content: string }>;
+  memoryId?: string;
+}
+
+function messageCallBody(index = 0): RequestBody {
+  const calls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+    (c) => typeof c[0] === "string" && c[0].includes("/api/messages/stream"),
+  );
+  return JSON.parse(calls[index][1].body) as RequestBody;
 }
 
 // ─── CH9: Real AI API call ───────────────────────────────────────────────────
@@ -84,9 +134,7 @@ describe("CH10 — AI persona includes person's name and relationship context", 
     render(<ChatScreen name="Grandma Betty" photo="blob:photo" onBack={vi.fn()} />);
     await sendMessage("Do you remember our garden?");
 
-    // FAILS: fetch is never called
-    const call = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    const body = JSON.parse(call[1].body);
+    const body = messageCallBody(0);
     expect(body.personName).toBe("Grandma Betty");
   });
 
@@ -95,18 +143,18 @@ describe("CH10 — AI persona includes person's name and relationship context", 
     render(<ChatScreen name="Grandma Betty" photo="blob:photo" onBack={vi.fn()} />);
     await sendMessage("Hi");
 
-    // FAILS: fetch is never called
-    const call = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    const body = JSON.parse(call[1].body);
+    const body = messageCallBody(0);
     expect(body.systemPrompt).toContain("Grandma Betty");
   });
 
-  it("welcome message references the person's name", () => {
+  it("welcome message body (not just header) references the person's name", () => {
     render(<ChatScreen name="Grandma Betty" photo="blob:photo" onBack={vi.fn()} />);
 
-    // FAILS: welcome message is generic and hardcoded; it never uses the name
+    // Must find the name inside the welcome greeting itself, not only the header.
     expect(
-      screen.getByText(/Grandma Betty/i)
+      screen.getByText(
+        (content) => /Grandma Betty/i.test(content) && /hear from you/i.test(content),
+      ),
     ).toBeInTheDocument();
   });
 });
@@ -115,13 +163,18 @@ describe("CH10 — AI persona includes person's name and relationship context", 
 
 describe("CH11 — Full conversation history sent with each API request", () => {
   it("sends all previous messages in the second API call", async () => {
-    let callCount = 0;
-    (global.fetch as ReturnType<typeof vi.fn>).mockImplementation(() => {
-      callCount++;
-      return Promise.resolve({
-        ok: true,
-        json: async () => ({ reply: `Reply ${callCount}` }),
-      });
+    let streamCount = 0;
+    (global.fetch as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
+      if (typeof url === "string" && url.includes("/api/health")) {
+        return Promise.resolve({ ok: true, status: 200 });
+      }
+      streamCount++;
+      return Promise.resolve(
+        sseResponse([
+          { type: "text_delta", content: `Reply ${streamCount}` },
+          { type: "stream_end", content: "" },
+        ]),
+      );
     });
 
     render(<ChatScreen name="Grandma" photo="blob:photo" onBack={vi.fn()} />);
@@ -132,15 +185,15 @@ describe("CH11 — Full conversation history sent with each API request", () => 
     await sendMessage("Second message");
     await waitFor(() => screen.getByText("Reply 2"));
 
-    // FAILS: fetch is never called; history is never sent
-    const secondCallBody = JSON.parse(
-      (global.fetch as ReturnType<typeof vi.fn>).mock.calls[1][1].body
+    const messageCalls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c) => typeof c[0] === "string" && c[0].includes("/api/messages/stream"),
     );
+    const secondCallBody = JSON.parse(messageCalls[1][1].body);
     expect(secondCallBody.history).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ role: "user", content: "First message" }),
         expect.objectContaining({ role: "assistant", content: "Reply 1" }),
-      ])
+      ]),
     );
   });
 
@@ -149,10 +202,7 @@ describe("CH11 — Full conversation history sent with each API request", () => 
     render(<ChatScreen name="Grandma" photo="blob:photo" onBack={vi.fn()} />);
     await sendMessage("Hello");
 
-    // FAILS: no API call is made
-    const body = JSON.parse(
-      (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body
-    );
+    const body = messageCallBody(0);
     expect(body.history[0]).toMatchObject({
       role: "assistant",
       content: expect.stringContaining("good to hear from you"),
@@ -177,10 +227,7 @@ describe("CH12 — API request includes a persona system prompt built from memor
     );
     await sendMessage("Hello");
 
-    // FAILS: fetch is never called
-    const body = JSON.parse(
-      (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body
-    );
+    const body = messageCallBody(0);
     expect(body.systemPrompt).toBeDefined();
     expect(typeof body.systemPrompt).toBe("string");
     expect(body.systemPrompt.length).toBeGreaterThan(50);
@@ -197,10 +244,7 @@ describe("CH12 — API request includes a persona system prompt built from memor
     );
     await sendMessage("Hello");
 
-    // FAILS: fetch is never called
-    const body = JSON.parse(
-      (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body
-    );
+    const body = messageCallBody(0);
     expect(body.systemPrompt.toLowerCase()).toContain("grandma betty");
   });
 });
@@ -301,30 +345,30 @@ describe("CH18 — Error handling when the AI API fails", () => {
 // ─── CH19: Conversation history persistence ───────────────────────────────────
 
 describe("CH19 — Messages persist across navigation and page refresh", () => {
-  it("saves messages to localStorage after each reply", async () => {
+  it("saves messages to a per-persona localStorage key after each reply", async () => {
     mockApiSuccess("I'm here.");
     render(<ChatScreen name="Grandma" photo="blob:photo" onBack={vi.fn()} />);
     await sendMessage("Hello");
 
     await waitFor(() => screen.getByText("I'm here."));
 
-    // FAILS: nothing written to localStorage
     expect(localStorage.setItem).toHaveBeenCalledWith(
-      "afterlife-messages",
-      expect.stringContaining("Hello")
+      "afterlife-messages:Grandma",
+      expect.stringContaining("Hello"),
     );
   });
 
-  it("loads saved messages from localStorage on mount", () => {
+  it("loads saved messages from localStorage on mount using the persona-scoped key", () => {
     const saved = JSON.stringify([
       { id: "1", role: "user" as const, content: "Saved message" },
       { id: "2", role: "assistant" as const, content: "Saved reply" },
     ]);
-    localStorage.getItem = vi.fn((key) => (key === "afterlife-messages" ? saved : null));
+    localStorage.getItem = vi.fn((key) =>
+      key === "afterlife-messages:Grandma" ? saved : null,
+    );
 
     render(<ChatScreen name="Grandma" photo="blob:photo" onBack={vi.fn()} />);
 
-    // FAILS: ChatScreen initialises from useState, never from localStorage
     expect(screen.getByText("Saved message")).toBeInTheDocument();
     expect(screen.getByText("Saved reply")).toBeInTheDocument();
   });

@@ -1,6 +1,13 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ArrowLeft, Send, Phone, Mic } from "lucide-react";
+import { ArrowLeft, Send, Phone, Mic, RotateCw } from "lucide-react";
+import {
+  sendMessageStream,
+  checkHealth,
+  buildSystemPrompt,
+  buildStorageKey,
+  type ChatHistoryTurn,
+} from "@/lib/streamClient";
 
 interface Message {
   id: string;
@@ -12,49 +19,170 @@ interface ChatScreenProps {
   name: string;
   photo: string;
   onBack: () => void;
+  memoryId?: string;
 }
 
-const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: "welcome",
-      role: "assistant",
-      content: `Hi there... it's so good to hear from you. What's on your mind?`,
-    },
-  ]);
+function makeId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function loadStoredMessages(storageKey: string): Message[] | null {
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    return parsed as Message[];
+  } catch {
+    return null;
+  }
+}
+
+const ChatScreen = ({ name, photo, onBack, memoryId }: ChatScreenProps) => {
+  const storageKey = buildStorageKey(memoryId, name);
+
+  const welcomeMessage: Message = {
+    id: "welcome",
+    role: "assistant",
+    content: `Hi sweetheart, it's ${name}. It's so good to hear from you. What's on your mind?`,
+  };
+
+  const [messages, setMessages] = useState<Message[]>(
+    () => loadStoredMessages(storageKey) ?? [welcomeMessage],
+  );
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastFailedText, setLastFailedText] = useState<string | null>(null);
+  const [serviceStatus, setServiceStatus] = useState<"online" | "unavailable">("online");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const streamRef = useRef<{ abort: () => void } | null>(null);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(messages));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [messages, storageKey]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      const status = await checkHealth(controller.signal);
+      if (!controller.signal.aborted) setServiceStatus(status);
+    }, 300);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [messages, isTyping]);
 
+  useEffect(() => {
+    return () => {
+      streamRef.current?.abort();
+    };
+  }, []);
+
+  const streamReply = useCallback(
+    (text: string, history: ChatHistoryTurn[]) => {
+      setIsSending(true);
+      setIsTyping(true);
+      setError(null);
+
+      const assistantId = makeId("a");
+
+      setMessages((prev) => [
+        ...prev,
+        { id: assistantId, role: "assistant", content: "" },
+      ]);
+
+      streamRef.current = sendMessageStream(
+        {
+          message: text,
+          personName: name,
+          systemPrompt: buildSystemPrompt(name),
+          history,
+          memoryId,
+        },
+        {
+          onDelta: (delta) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, content: m.content + delta } : m,
+              ),
+            );
+          },
+          onDone: () => {
+            setIsTyping(false);
+            setIsSending(false);
+            setLastFailedText(null);
+            streamRef.current = null;
+          },
+          onError: (kind) => {
+            setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+            setIsTyping(false);
+            setIsSending(false);
+            setError(
+              kind === "network"
+                ? "No connection. Please check your network and try again."
+                : "Something went wrong. Please try again.",
+            );
+            setLastFailedText(text);
+            streamRef.current = null;
+          },
+        },
+      );
+    },
+    [name, memoryId],
+  );
+
   const sendMessage = () => {
-    if (!input.trim()) return;
-    const userMsg: Message = { id: Date.now().toString(), role: "user", content: input.trim() };
+    const text = input.trim();
+    if (!text || isSending) return;
+
+    const userMsg: Message = { id: makeId("u"), role: "user", content: text };
+    const historyForApi: ChatHistoryTurn[] = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
-    setIsTyping(true);
-
-    // Simulated response
-    setTimeout(() => {
-      const responses = [
-        `I remember that too. Those were such beautiful times.`,
-        `You know, I'm always here whenever you need me.`,
-        `That means so much to me. Tell me more...`,
-        `I think about those moments all the time.`,
-        `You've always been so special to me. Never forget that.`,
-      ];
-      const reply: Message = {
-        id: (Date.now() + 1).toString(),
-        role: "assistant",
-        content: responses[Math.floor(Math.random() * responses.length)],
-      };
-      setMessages((prev) => [...prev, reply]);
-      setIsTyping(false);
-    }, 1500 + Math.random() * 1000);
+    streamReply(text, historyForApi);
   };
+
+  const retryLast = () => {
+    if (!lastFailedText || isSending) return;
+    const trimmed: Message[] = [];
+    let removed = false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (
+        !removed &&
+        m.role === "user" &&
+        m.content === lastFailedText
+      ) {
+        removed = true;
+        continue;
+      }
+      trimmed.unshift(m);
+    }
+    const historyForApi: ChatHistoryTurn[] = trimmed.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+    streamReply(lastFailedText, historyForApi);
+  };
+
+  const statusLabel = serviceStatus === "online" ? "Online" : "Unavailable";
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -68,7 +196,7 @@ const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
         </div>
         <div className="flex-1">
           <p className="font-heading text-sm font-semibold text-foreground">{name}</p>
-          <p className="font-body text-xs text-muted-foreground">Online</p>
+          <p className="font-body text-xs text-muted-foreground">{statusLabel}</p>
         </div>
         <button className="w-9 h-9 rounded-full bg-card flex items-center justify-center text-foreground">
           <Phone size={16} />
@@ -99,18 +227,40 @@ const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
           ))}
         </AnimatePresence>
 
-        {isTyping && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="flex justify-start"
-          >
-            <div className="bg-card border border-border/50 rounded-2xl rounded-bl-md px-4 py-3 flex gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" />
-              <span className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: "0.15s" }} />
-              <span className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: "0.3s" }} />
-            </div>
-          </motion.div>
+        <div
+          data-testid="typing-indicator"
+          aria-live="polite"
+          aria-hidden={!isTyping}
+          className={isTyping ? "flex justify-start" : "hidden"}
+        >
+          <div className="bg-card border border-border/50 rounded-2xl rounded-bl-md px-4 py-3 flex gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse" />
+            <span
+              className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse"
+              style={{ animationDelay: "0.15s" }}
+            />
+            <span
+              className="w-2 h-2 rounded-full bg-muted-foreground/40 animate-pulse"
+              style={{ animationDelay: "0.3s" }}
+            />
+          </div>
+        </div>
+
+        {error && (
+          <div role="alert" className="flex flex-col items-start gap-2">
+            <p className="font-body text-xs text-destructive">{error}</p>
+            {lastFailedText && (
+              <button
+                type="button"
+                onClick={retryLast}
+                disabled={isSending}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-card border border-border text-xs text-foreground"
+              >
+                <RotateCw size={12} />
+                Retry
+              </button>
+            )}
+          </div>
         )}
       </div>
 
@@ -133,7 +283,7 @@ const ChatScreen = ({ name, photo, onBack }: ChatScreenProps) => {
           <motion.button
             whileTap={{ scale: 0.9 }}
             onClick={sendMessage}
-            disabled={!input.trim()}
+            disabled={!input.trim() || isSending}
             className="w-10 h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center flex-shrink-0 disabled:opacity-30"
           >
             <Send size={16} />
