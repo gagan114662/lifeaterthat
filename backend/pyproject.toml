@@ -21,4 +21,5 @@ include = ["app*", "testing_utils*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
 testpaths = ["tests"]
