@@ -9,6 +9,7 @@ dependencies = [
     "anthropic>=0.52.0",
     "python-multipart>=0.0.20",
     "httpx>=0.28.0",
+    "pyjwt>=2.8.0,<3",
 ]
 
 [project.optional-dependencies]

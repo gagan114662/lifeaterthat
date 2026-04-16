@@ -1,9 +1,12 @@
 import json
 import logging
 
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.api.call import router as call_router
+from app.api.deps import UnauthorizedError, get_current_user
+from app.api.memories import router as memories_router
 from app.api.upload import router as upload_router
 from app.models.stream import MessageRequest
 from app.services import ai_service
@@ -14,10 +17,22 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Afterlife API")
 app.include_router(upload_router)
+app.include_router(memories_router)
+app.include_router(call_router)
 
 FALLBACK_ON_ERROR = (
     "I love you, sweetheart. I hear you. I'm always here for you."
 )
+
+
+@app.exception_handler(UnauthorizedError)
+async def _unauthorized_handler(_request: Request, _exc: UnauthorizedError):
+    return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+
+@app.get("/health")
+async def health_root():
+    return {"status": "ok"}
 
 
 @app.get("/api/health")
@@ -66,7 +81,10 @@ async def call_llm(request: MessageRequest):
 
 
 @app.post("/api/messages/stream")
-async def stream_messages(request: MessageRequest):
+async def stream_messages(
+    request: MessageRequest,
+    current_user: dict = Depends(get_current_user),
+):
     # === SAFETY CHECK — runs BEFORE any LLM call ===
     if is_crisis_message(request.message):
         logger.warning("Crisis message detected (no PII logged)")
