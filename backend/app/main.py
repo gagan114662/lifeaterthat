@@ -5,11 +5,17 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
 from app.models.stream import MessageRequest
+from app.services import ai_service
+from app.services.persona_service import build_system_prompt
 from app.services.safety_service import is_crisis_message, SAFE_RESPONSE
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Afterlife API")
+
+FALLBACK_ON_ERROR = (
+    "I love you, sweetheart. I hear you. I'm always here for you."
+)
 
 
 @app.get("/api/health")
@@ -17,24 +23,44 @@ async def health():
     return {"status": "ok"}
 
 
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 async def _stream_safe_response():
     """Yield the deterministic crisis response as SSE chunks."""
-    chunk = json.dumps({"type": "text_delta", "content": SAFE_RESPONSE})
-    yield f"data: {chunk}\n\n"
-    end = json.dumps({"type": "stream_end", "content": ""})
-    yield f"data: {end}\n\n"
+    yield _sse({"type": "text_delta", "content": SAFE_RESPONSE})
+    yield _sse({"type": "stream_end", "content": ""})
 
 
 async def call_llm(request: MessageRequest):
+    """Stream a persona reply from Claude as SSE events.
+
+    Each text delta becomes a `text_delta` SSE event; the stream ends
+    with a single `stream_end` event. On upstream failure we emit a
+    gentle fallback delta followed by `stream_end` so the client never
+    hangs mid-stream.
     """
-    Placeholder for the real Claude API call (Issue #1).
-    Returns a simple grief-appropriate fallback until wired up.
-    """
-    fallback = f"I hear you. I'm always here for you. \u2014 {request.personName}"
-    chunk = json.dumps({"type": "text_delta", "content": fallback})
-    yield f"data: {chunk}\n\n"
-    end = json.dumps({"type": "stream_end", "content": ""})
-    yield f"data: {end}\n\n"
+    system_prompt = request.systemPrompt or build_system_prompt(request.personName)
+
+    emitted_any = False
+    try:
+        async for delta in ai_service.stream_message(
+            person_name=request.personName,
+            user_message=request.message,
+            history=request.history,
+            system_prompt=system_prompt,
+        ):
+            if not delta:
+                continue
+            emitted_any = True
+            yield _sse({"type": "text_delta", "content": delta})
+    except Exception:
+        logger.exception("LLM stream failed")
+        if not emitted_any:
+            yield _sse({"type": "text_delta", "content": FALLBACK_ON_ERROR})
+
+    yield _sse({"type": "stream_end", "content": ""})
 
 
 @app.post("/api/messages/stream")

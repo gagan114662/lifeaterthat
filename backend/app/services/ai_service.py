@@ -1,9 +1,14 @@
 """AI service — handles conversation with Claude API."""
 
+import os
+from typing import AsyncIterator
+
 import httpx
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 MAX_CONTEXT_CHARS = 16_384  # ~4096 tokens at 4 chars/token
+STREAM_MODEL = "claude-sonnet-4-6"
+STREAM_MAX_TOKENS = 1024
 
 
 async def build_system_prompt(person_name: str) -> str:
@@ -85,3 +90,49 @@ async def send_message(
         response.raise_for_status()
         data = response.json()
         return data["content"][0]["text"]
+
+
+async def stream_message(
+    *,
+    person_name: str,
+    user_message: str,
+    history: list[dict],
+    system_prompt: str,
+    api_key: str | None = None,
+) -> AsyncIterator[str]:
+    """Stream a reply from Claude token-by-token.
+
+    Yields plain-text deltas. Callers wrap each delta into an SSE
+    `text_delta` chunk and emit a terminal `stream_end` themselves.
+
+    Args:
+        person_name: Persona display name (for future attribution).
+        user_message: The current turn's user message.
+        history: Prior conversation turns. Gets windowed against
+            MAX_CONTEXT_CHARS to bound cost.
+        system_prompt: The pre-built persona prompt (from
+            persona_service.build_system_prompt).
+        api_key: Anthropic key. Defaults to the ANTHROPIC_API_KEY env var.
+    """
+    from anthropic import AsyncAnthropic  # imported lazily to keep test startup light
+
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set — cannot stream from Claude."
+        )
+
+    windowed = window_history(history, user_message, system_prompt)
+    messages = [{"role": m["role"], "content": m["content"]} for m in windowed]
+    messages.append({"role": "user", "content": user_message})
+
+    client = AsyncAnthropic(api_key=key)
+    async with client.messages.stream(
+        model=STREAM_MODEL,
+        max_tokens=STREAM_MAX_TOKENS,
+        system=system_prompt,
+        messages=messages,
+    ) as stream:
+        async for text in stream.text_stream:
+            if text:
+                yield text
