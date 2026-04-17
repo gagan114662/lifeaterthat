@@ -28,3 +28,7 @@ dist-ssr
 __pycache__
 *.pyc
 .pytest_cache
+
+# Local environment — never commit real credentials
+.env
+.env.local
