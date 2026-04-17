@@ -1,8 +1,15 @@
 import json
 import logging
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
+
+_pyproject = Path(__file__).parent.parent / "pyproject.toml"
+with _pyproject.open("rb") as _f:
+    _VERSION: str = tomllib.load(_f)["project"]["version"]
 
 from app.api.upload import router as upload_router
 from app.models.stream import MessageRequest
@@ -22,7 +29,11 @@ FALLBACK_ON_ERROR = (
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": _VERSION,
+    }
 
 
 def _sse(payload: dict) -> str:
