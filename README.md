@@ -1,3 +1,5 @@
+_Last updated by bridge agent_
+
 # After Life
 
 A platform for preserving memories and conversing with AI personas of loved ones.
