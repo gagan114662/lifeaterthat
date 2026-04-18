@@ -15,7 +15,9 @@ import CreateMemory from "@/components/CreateMemory";
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function navigateToStep2() {
-  await userEvent.type(screen.getByPlaceholderText("Their name..."), "Grandma Betty");
+  fireEvent.change(screen.getByPlaceholderText("Their name..."), {
+    target: { value: "Grandma Betty" },
+  });
   await userEvent.click(screen.getByText("Continue"));
 }
 
@@ -26,10 +28,38 @@ async function uploadPhoto(container: HTMLElement) {
   });
 }
 
+async function waitForPhotoUpload() {
+  await waitFor(() => {
+    expect(screen.getByAltText("Uploaded")).toBeInTheDocument();
+    expect(screen.getByText("Continue")).not.toBeDisabled();
+  });
+}
+
+async function uploadVoice(
+  container: HTMLElement,
+  file = new File(["audio"], "voice.webm", { type: "audio/webm" }),
+) {
+  const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
+  fireEvent.change(voiceInput, {
+    target: { files: [file] },
+  });
+}
+
+async function waitForVoiceUpload() {
+  await waitFor(() => {
+    expect(screen.getByText("Voice sample ready")).toBeInTheDocument();
+    expect(screen.getByText("Start Conversation")).not.toBeDisabled();
+  });
+}
+
 async function navigateToStep3(container: HTMLElement) {
   await navigateToStep2();
   await uploadPhoto(container);
+  await waitForPhotoUpload();
   await userEvent.click(screen.getByText("Continue"));
+  await waitFor(() => {
+    expect(screen.getByText("Tap to record")).toBeInTheDocument();
+  });
 }
 
 // ─── C5: Photo uploaded to cloud storage ─────────────────────────────────────
@@ -63,15 +93,10 @@ describe("C5 — Photo is uploaded to cloud storage", () => {
 
     const onComplete = vi.fn();
     const { container } = render(<CreateMemory onComplete={onComplete} onBack={vi.fn()} />);
-    await navigateToStep2();
-    await uploadPhoto(container);
-    await userEvent.click(screen.getByText("Continue"));
     await navigateToStep3(container);
 
-    const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
-    fireEvent.change(voiceInput, {
-      target: { files: [new File(["a"], "v.webm", { type: "audio/webm" })] },
-    });
+    await uploadVoice(container, new File(["a"], "v.webm", { type: "audio/webm" }));
+    await waitForVoiceUpload();
     await userEvent.click(screen.getByText("Start Conversation"));
 
     // FAILS: onComplete receives a blob: URL, not a CDN URL
@@ -92,10 +117,8 @@ describe("C5 — Photo is uploaded to cloud storage", () => {
     const { container } = render(<CreateMemory onComplete={onComplete} onBack={vi.fn()} />);
     await navigateToStep3(container);
 
-    const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
-    fireEvent.change(voiceInput, {
-      target: { files: [new File(["a"], "v.webm", { type: "audio/webm" })] },
-    });
+    await uploadVoice(container, new File(["a"], "v.webm", { type: "audio/webm" }));
+    await waitForVoiceUpload();
     await userEvent.click(screen.getByText("Start Conversation"));
 
     await waitFor(() => {
@@ -110,18 +133,20 @@ describe("C5 — Photo is uploaded to cloud storage", () => {
 
 describe("C6 — Voice sample is uploaded to cloud storage", () => {
   it("POSTs the audio file to /api/upload/audio", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => ({ url: "https://cdn.example.com/audio/voice.webm" }),
-    });
+    (global.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/photos/abc.jpg" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/audio/voice.webm" }),
+      });
 
     const { container } = render(<CreateMemory onComplete={vi.fn()} onBack={vi.fn()} />);
     await navigateToStep3(container);
 
-    const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
-    fireEvent.change(voiceInput, {
-      target: { files: [new File(["audio"], "voice.webm", { type: "audio/webm" })] },
-    });
+    await uploadVoice(container);
 
     // FAILS: handleVoiceUpload only calls URL.createObjectURL; no fetch/upload
     await waitFor(() => {
@@ -133,16 +158,21 @@ describe("C6 — Voice sample is uploaded to cloud storage", () => {
   });
 
   it("also uploads audio recorded via MediaRecorder to cloud", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => ({ url: "https://cdn.example.com/audio/recorded.webm" }),
-    });
+    (global.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/photos/abc.jpg" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/audio/recorded.webm" }),
+      });
 
     const { container } = render(<CreateMemory onComplete={vi.fn()} onBack={vi.fn()} />);
     await navigateToStep3(container);
 
-    await userEvent.click(screen.getByText("Tap to record"));
-    await userEvent.click(screen.getByText("Recording... Tap to stop"));
+    await userEvent.click(screen.getByRole("button", { name: /tap to record/i }));
+    await userEvent.click(screen.getByRole("button", { name: /recording... tap to stop/i }));
 
     // FAILS: onstop handler only calls URL.createObjectURL on the Blob, never uploads
     await waitFor(() => {
@@ -158,23 +188,30 @@ describe("C6 — Voice sample is uploaded to cloud storage", () => {
 
 describe("C7 — Memory is persisted to the backend database", () => {
   it("POSTs to /api/memories when the wizard completes", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        id: "mem-001",
-        name: "Grandma Betty",
-        photoUrl: "https://cdn.example.com/photos/abc.jpg",
-        voiceUrl: "https://cdn.example.com/audio/voice.webm",
-      }),
-    });
+    (global.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/photos/abc.jpg" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/audio/voice.webm" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: "mem-001",
+          name: "Grandma Betty",
+          photoUrl: "https://cdn.example.com/photos/abc.jpg",
+          voiceUrl: "https://cdn.example.com/audio/voice.webm",
+        }),
+      });
 
     const { container } = render(<CreateMemory onComplete={vi.fn()} onBack={vi.fn()} />);
     await navigateToStep3(container);
 
-    const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
-    fireEvent.change(voiceInput, {
-      target: { files: [new File(["a"], "v.webm", { type: "audio/webm" })] },
-    });
+    await uploadVoice(container, new File(["a"], "v.webm", { type: "audio/webm" }));
+    await waitForVoiceUpload();
     await userEvent.click(screen.getByText("Start Conversation"));
 
     // FAILS: no /api/memories call; onComplete fires immediately with blob URLs
@@ -190,19 +227,26 @@ describe("C7 — Memory is persisted to the backend database", () => {
   });
 
   it("passes the database memory ID to onComplete", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "mem-001", name: "Grandma Betty" }),
-    });
+    (global.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/photos/abc.jpg" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/audio/voice.webm" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "mem-001", name: "Grandma Betty" }),
+      });
 
     const onComplete = vi.fn();
     const { container } = render(<CreateMemory onComplete={onComplete} onBack={vi.fn()} />);
     await navigateToStep3(container);
 
-    const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
-    fireEvent.change(voiceInput, {
-      target: { files: [new File(["a"], "v.webm", { type: "audio/webm" })] },
-    });
+    await uploadVoice(container, new File(["a"], "v.webm", { type: "audio/webm" }));
+    await waitForVoiceUpload();
     await userEvent.click(screen.getByText("Start Conversation"));
 
     // FAILS: onComplete receives no memoryId field
@@ -263,24 +307,26 @@ describe("C12 — Upload errors are surfaced to the user", () => {
 
     // FAILS: no upload error handling; photo is always accepted
     await waitFor(() => {
-      expect(screen.getByText(/upload failed|file too large|try again/i)).toBeInTheDocument();
+      expect(screen.getByText("Upload failed. Please try again.")).toBeInTheDocument();
     });
   });
 
   it("shows an error when the audio upload fails", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: false, status: 500 });
+    (global.fetch as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ url: "https://cdn.example.com/photos/abc.jpg" }),
+      })
+      .mockResolvedValueOnce({ ok: false, status: 500 });
 
     const { container } = render(<CreateMemory onComplete={vi.fn()} onBack={vi.fn()} />);
     await navigateToStep3(container);
 
-    const voiceInput = container.querySelector('input[accept="audio/*"]') as HTMLInputElement;
-    fireEvent.change(voiceInput, {
-      target: { files: [new File(["a"], "v.webm", { type: "audio/webm" })] },
-    });
+    await uploadVoice(container, new File(["a"], "v.webm", { type: "audio/webm" }));
 
     // FAILS: no upload error handling
     await waitFor(() => {
-      expect(screen.getByText(/upload failed|try again/i)).toBeInTheDocument();
+      expect(screen.getByText("Upload failed. Please try again.")).toBeInTheDocument();
     });
   });
 

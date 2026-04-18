@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom";
-import { vi } from "vitest";
+import { cleanup } from "@testing-library/react";
+import { afterEach, beforeEach, vi } from "vitest";
 
-// ─── matchMedia ───────────────────────────────────────────────────────────────
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({
@@ -16,17 +16,14 @@ Object.defineProperty(window, "matchMedia", {
   }),
 });
 
-// ─── URL blob helpers ─────────────────────────────────────────────────────────
 let blobCounter = 0;
-global.URL.createObjectURL = vi.fn(() => `blob:mock-url-${++blobCounter}`);
-global.URL.revokeObjectURL = vi.fn();
+globalThis.URL.createObjectURL = vi.fn(() => `blob:mock-url-${++blobCounter}`);
+globalThis.URL.revokeObjectURL = vi.fn();
 
-// ─── scrollTo ─────────────────────────────────────────────────────────────────
 window.HTMLElement.prototype.scrollTo = vi.fn();
 
-// ─── MediaRecorder ────────────────────────────────────────────────────────────
 class MockMediaRecorder {
-  state: string = "inactive";
+  state = "inactive";
   ondataavailable: ((e: { data: Blob }) => void) | null = null;
   onstop: (() => void) | null = null;
 
@@ -36,40 +33,29 @@ class MockMediaRecorder {
 
   stop = vi.fn(() => {
     this.state = "inactive";
-    // Simulate data then stop
     this.ondataavailable?.({ data: new Blob(["audio"], { type: "audio/webm" }) });
     this.onstop?.();
   });
 }
 
-Object.defineProperty(global, "MediaRecorder", {
+Object.defineProperty(globalThis, "MediaRecorder", {
   writable: true,
   value: MockMediaRecorder,
 });
 
-// ─── navigator.mediaDevices ───────────────────────────────────────────────────
-const mockStream = {
-  getTracks: () => [{ stop: vi.fn() }],
-};
-
-Object.defineProperty(navigator, "mediaDevices", {
-  writable: true,
-  value: {
-    getUserMedia: vi.fn().mockResolvedValue(mockStream),
-  },
-});
-
-// ─── fetch ────────────────────────────────────────────────────────────────────
-global.fetch = vi.fn();
-
-// ─── localStorage ─────────────────────────────────────────────────────────────
 const localStorageMock = (() => {
   let store: Record<string, string> = {};
   return {
     getItem: vi.fn((key: string) => store[key] ?? null),
-    setItem: vi.fn((key: string, value: string) => { store[key] = value; }),
-    removeItem: vi.fn((key: string) => { delete store[key]; }),
-    clear: vi.fn(() => { store = {}; }),
+    setItem: vi.fn((key: string, value: string) => {
+      store[key] = value;
+    }),
+    removeItem: vi.fn((key: string) => {
+      delete store[key];
+    }),
+    clear: vi.fn(() => {
+      store = {};
+    }),
   };
 })();
 
@@ -78,13 +64,30 @@ Object.defineProperty(window, "localStorage", {
   value: localStorageMock,
 });
 
-// ─── Reset mocks between tests ────────────────────────────────────────────────
+function createMockStream() {
+  return {
+    getTracks: () => [{ stop: vi.fn() }],
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   blobCounter = 0;
-  global.URL.createObjectURL = vi.fn(() => `blob:mock-url-${++blobCounter}`);
-  global.URL.revokeObjectURL = vi.fn();
-  global.fetch = vi.fn();
-  (navigator.mediaDevices.getUserMedia as ReturnType<typeof vi.fn>).mockResolvedValue(mockStream);
+
+  globalThis.URL.createObjectURL = vi.fn(() => `blob:mock-url-${++blobCounter}`);
+  globalThis.URL.revokeObjectURL = vi.fn();
+  globalThis.fetch = vi.fn();
+
+  Object.defineProperty(navigator, "mediaDevices", {
+    writable: true,
+    value: {
+      getUserMedia: vi.fn().mockResolvedValue(createMockStream()),
+    },
+  });
+
   localStorage.clear();
+});
+
+afterEach(() => {
+  cleanup();
 });
