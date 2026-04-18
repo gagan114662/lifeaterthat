@@ -10,6 +10,7 @@ interface MemoryData {
   name: string;
   photo: string;
   voiceSample: string;
+  memoryId: string;
 }
 
 const Index = () => {
@@ -40,6 +41,7 @@ const Index = () => {
             <ChatScreen
               name={memoryData.name}
               photo={memoryData.photo}
+              memoryId={memoryData.memoryId}
               onBack={() => setScreen("create")}
             />
           </motion.div>

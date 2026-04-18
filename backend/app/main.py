@@ -12,6 +12,7 @@ with _pyproject.open("rb") as _f:
     _VERSION: str = tomllib.load(_f)["project"]["version"]
 
 from app.api.upload import router as upload_router
+from app.api.memories import router as memories_router
 from app.models.stream import MessageRequest
 from app.services import ai_service
 from app.services.persona_service import build_system_prompt
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Afterlife API")
 app.include_router(upload_router)
+app.include_router(memories_router)
 
 FALLBACK_ON_ERROR = (
     "I love you, sweetheart. I hear you. I'm always here for you."
