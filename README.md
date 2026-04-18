@@ -1,4 +1,4 @@
-[//]: # (Last updated by bridge agent)
+_Last updated by bridge agent_
 
 # After Life
 
